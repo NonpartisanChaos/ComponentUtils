@@ -1,12 +1,12 @@
 {
   "name": "com.npc.component-utils",
   "version": "1.0.0",
-  "unity": "2022.3",
+  "unity": "2020.3",
   "displayName": "Component Utils",
   "description": "Unity component utilities",
   "author": {
     "name": "NonpartisanChaos",
     "email": "nonpartisanchaos@gmail.com",
-    "url": "http://github.com/NonpartisanChaos/ComponentUtils"
+    "url": "https://github.com/NonpartisanChaos/ComponentUtils"
   }
 }

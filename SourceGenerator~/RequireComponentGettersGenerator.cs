@@ -18,98 +18,139 @@ public class RequireComponentGettersGenerator : ISourceGenerator {
             return;
         }
 
-        foreach (var info in receiver.Infos) {
+        foreach (var info in receiver.ClassInfoByFullName.Values) {
             var hasNamespace = info.ClassNamespace.Length > 0;
 
+            //if there are any diagnostic issues, report them and maybe skip generating for this class
+            if (info.Diagnostics.Count > 0) {
+                var shouldSkip = false;
+                foreach (var diagnostic in info.Diagnostics) {
+                    shouldSkip |= diagnostic.Severity == DiagnosticSeverity.Error || diagnostic.IsWarningAsError;
+                    context.ReportDiagnostic(diagnostic);
+                }
+
+                if (shouldSkip) {
+                    continue;
+                }
+            }
+
+            //any type that has a ComponentTypeArgument requires:
+            // - a generated [RequireComponent(...)] attribute
+            // - a custom generated getter
+            // - no conflicting auto-named property getters
+            info.ComponentTypes.RemoveWhere(t => info.ComponentTypeArguments.ContainsKey(t));
+
             var source = $@"
-{AllUsingSource(info.ClassDeclaration)}
+{GenerateAllUsingSource(info.ClassDeclaration)}
 
 {(hasNamespace ? $"namespace {info.ClassNamespace} {{" : "")}
+{GenerateAllNamedRequireComponentSource(info.ComponentTypeArguments)}
 public partial class {info.ClassName} {{
-{AllGettersSource(info.Arguments, info.ComponentTypes)}
+{(info.GettersArguments.HasValue ? GenerateAllDefaultGettersSource(info.GettersArguments.Value, info.ComponentTypes) : "")}
+{GenerateAllNamedGettersSource(info.ComponentTypeArguments)}
 }}
 {(hasNamespace ? "}" : "")}
 ";
+
             context.AddSource($"{info.ClassName}.Getters.g.cs", SourceText.From(source, Encoding.UTF8));
         }
     }
 
-    private string AllUsingSource(ClassDeclarationSyntax classDeclaration) {
-        //exactly duplicate all using statements from the original class' file
-        //this handles namespaces, aliases and fully-qualified names
+    /// <summary>
+    /// Generate code that exactly duplicates all using statements from the specified class' file.
+    /// This handles namespaces, aliases and fully-qualified names.
+    /// </summary>
+    private static string GenerateAllUsingSource(ClassDeclarationSyntax classDeclaration) {
         var root = classDeclaration.SyntaxTree.GetRoot();
         var usings = root.DescendantNodes().OfType<UsingDirectiveSyntax>().OrderBy(u => u.SpanStart);
 
         return string.Join(Environment.NewLine, usings.Select(u => u.ToString()));
     }
 
-    private string AllGettersSource(in RequireComponentGettersArguments arguments, IEnumerable<string> componentTypes) {
+    /// <summary>
+    /// Generate code that adds a cached property with the specified visibility, type, and name.
+    /// </summary>
+    private static string GenerateGetterSource(string visibility, string typeName, string generatedPropertyName) {
+        //"MyCoolComponent" -> "_myCoolComponent"
+        var cacheVarName = $"_{char.ToLowerInvariant(generatedPropertyName[0])}{generatedPropertyName.Substring(1)}";
+
+        return $@"
+    private {typeName} {cacheVarName};
+    {visibility} {typeName} {generatedPropertyName} => {cacheVarName} ??= GetComponent<{typeName}>();
+";
+    }
+
+    private string GenerateAllDefaultGettersSource(in RequireComponentGettersArguments arguments, IEnumerable<string> componentTypes) {
         var sb = new StringBuilder();
         foreach (var componentType in componentTypes) {
-            sb.Append(GetterSource(arguments, componentType));
+            //automatically generate a name based on the type name, trimming the namespace
+            //"Some.Name.Space.MyCoolComponent" -> "MyCoolComponent"
+            var generatedPropertyName = componentType.Substring(componentType.LastIndexOf('.') + 1);
+
+            sb.Append(GenerateGetterSource(arguments.Visibility, componentType, generatedPropertyName));
         }
 
         return sb.ToString();
     }
 
-    private string GetterSource(in RequireComponentGettersArguments arguments, string typeName) {
-        //trim namespace ("Some.Name.Space.MyCoolComponent" -> "MyCoolComponent")
-        var propertyName = typeName.Substring(typeName.LastIndexOf('.') + 1);
+    private string GenerateAllNamedGettersSource(Dictionary<string, RequireComponentGetterArguments> typeArguments) {
+        var sb = new StringBuilder();
+        foreach (var entry in typeArguments) {
+            var componentType = entry.Key;
+            var arguments = entry.Value;
 
-        //"_myCoolComponent"
-        var cacheVarName = $"_{char.ToLowerInvariant(propertyName[0])}{propertyName.Substring(1)}";
+            sb.Append(GenerateGetterSource(arguments.Visibility, componentType, arguments.Name));
+        }
 
-        return $@"
-    private {typeName} {cacheVarName};
-    {arguments.Visibility} {typeName} {propertyName} => {cacheVarName} ??= GetComponent<{typeName}>();
-";
+        return sb.ToString();
+    }
+
+    private string GenerateAllNamedRequireComponentSource(Dictionary<string, RequireComponentGetterArguments> typeArguments) {
+        var sb = new StringBuilder();
+        foreach (var componentType in typeArguments.Keys) {
+            sb.Append($"[RequireComponent(typeof({componentType}))]\n");
+        }
+
+        return sb.ToString();
     }
 
     private struct RequireComponentGettersArguments {
         public string Visibility { get; set; }
     }
 
-    private struct RequireComponentGettersInfo {
-        public RequireComponentGettersArguments Arguments { get; set; }
-        public ClassDeclarationSyntax ClassDeclaration { get; set; }
-        public string ClassNamespace { get; set; }
-        public string ClassName { get; set; }
-        public HashSet<string> ComponentTypes { get; set; }
+    private struct RequireComponentGetterArguments {
+        public string Name { get; set; }
+        public string Visibility { get; set; }
     }
 
-    private class SyntaxReceiver : ISyntaxReceiver {
-        public List<RequireComponentGettersInfo> Infos { get; } = new();
+    /// <summary>
+    /// Holds all RequireComponent, RequireComponentGetter and RequireComponentGetters info for a single class.
+    /// </summary>
+    private class ClassInfo {
+        public ClassDeclarationSyntax ClassDeclaration { get; }
+        public string ClassNamespace { get; }
+        public string ClassName { get; }
 
-        public void OnVisitSyntaxNode(SyntaxNode syntaxNode) {
-            if (syntaxNode is AttributeSyntax attribute
-                && attribute.Name.ToString() == "RequireComponentGetters"
-                && attribute.Parent is AttributeListSyntax attributeList
-                && attributeList.Parent is ClassDeclarationSyntax classDeclaration) {
-                Infos.Add(new RequireComponentGettersInfo {
-                    Arguments = GetAttributeArguments(attribute),
-                    ClassDeclaration = classDeclaration,
-                    ClassNamespace = GetFullNamespace(classDeclaration),
-                    ClassName = classDeclaration.Identifier.Text,
-                    ComponentTypes = GetRequireComponentTypes(classDeclaration),
-                });
-            }
+        //all RequireComponent types for all attributes on the class
+        public HashSet<string> ComponentTypes { get; }
+
+        //only relevant if [RequireComponentGetters] is present
+        public RequireComponentGettersArguments? GettersArguments { get; set; }
+
+        //only relevant if one or more [RequireComponentGetter(...)] is present
+        public Dictionary<string, RequireComponentGetterArguments> ComponentTypeArguments { get; } = new();
+
+        public List<Diagnostic> Diagnostics { get; } = new();
+
+        public ClassInfo(ClassDeclarationSyntax classDeclaration, string classNamespace, string className) {
+            ClassDeclaration = classDeclaration;
+            ClassNamespace = classNamespace;
+            ClassName = className;
+
+            ComponentTypes = GetRequireComponentTypes(classDeclaration);
         }
 
-        private RequireComponentGettersArguments GetAttributeArguments(AttributeSyntax attribute) {
-            //NOTE - must exactly match RequireComponentGettersAttribute argument defaults
-            var visibility = "public";
-
-            //for now there's only one argument: visibility
-            if (attribute.ArgumentList?.Arguments.FirstOrDefault()?.Expression is LiteralExpressionSyntax literalExpression) {
-                visibility = literalExpression.Token.ValueText;
-            }
-
-            return new RequireComponentGettersArguments {
-                Visibility = visibility,
-            };
-        }
-
-        private HashSet<string> GetRequireComponentTypes(ClassDeclarationSyntax classDeclaration) {
+        private static HashSet<string> GetRequireComponentTypes(ClassDeclarationSyntax classDeclaration) {
             //unique types because RequireComponent may be specified any number of times with the same types
             var componentTypes = new HashSet<string>();
 
@@ -121,12 +162,104 @@ public partial class {info.ClassName} {{
             //find all typeof(__) expressions in arguments and extract the type
             foreach (var arg in requireComponentArgs) {
                 if (arg.Expression is TypeOfExpressionSyntax typeOf) {
-                    //TODO does this need to be the fully-qualified name?
                     componentTypes.Add(typeOf.Type.ToString());
                 }
             }
 
             return componentTypes;
+        }
+    }
+
+    private class SyntaxReceiver : ISyntaxReceiver {
+        public Dictionary<string, ClassInfo> ClassInfoByFullName { get; } = new();
+
+        public void OnVisitSyntaxNode(SyntaxNode syntaxNode) {
+            //only consider attributes attached to a class
+            if (syntaxNode is AttributeSyntax attribute
+                && attribute.Parent is AttributeListSyntax attributeList
+                && attributeList.Parent is ClassDeclarationSyntax classDeclaration) {
+                if (attribute.Name.ToString() == "RequireComponentGetters") {
+                    //[RequireComponentGetters] attribute
+                    var info = GetOrCreateClassInfo(classDeclaration);
+                    AddRequireComponentGettersArguments(info, attribute);
+                } else if (attribute.Name.ToString() == "RequireComponentGetter") {
+                    //[RequireComponentGetter(...)] attribute
+                    var info = GetOrCreateClassInfo(classDeclaration);
+                    AddRequireComponentGetterInfo(info, attribute);
+                }
+            }
+        }
+
+        private ClassInfo GetOrCreateClassInfo(ClassDeclarationSyntax classDeclaration) {
+            var classNamespace = GetFullNamespace(classDeclaration);
+            var className = classDeclaration.Identifier.Text;
+            var classFullName = $"{classNamespace}.{className}";
+
+            if (!ClassInfoByFullName.TryGetValue(classFullName, out var info)) {
+                info = new ClassInfo(classDeclaration, classNamespace, className);
+                ClassInfoByFullName.Add(classFullName, info);
+            }
+
+            return info;
+        }
+
+        private void AddRequireComponentGettersArguments(ClassInfo info, AttributeSyntax attribute) {
+            //1st argument "visibility"
+            var visibilityArgument = GetAttributeArgumentByNameOrIndex(attribute, "visibility", 0);
+
+            //NOTE - default value must exactly match RequireComponentGettersAttribute argument default
+            var visibility = visibilityArgument?.Expression is LiteralExpressionSyntax literalExpression ? literalExpression.Token.ValueText : "public";
+
+            info.GettersArguments = new RequireComponentGettersArguments {
+                Visibility = visibility,
+            };
+        }
+
+        private void AddRequireComponentGetterInfo(ClassInfo info, AttributeSyntax attribute) {
+            //1st argument "type" (required)
+            var typeArgument = GetAttributeArgumentByNameOrIndex(attribute, "type", 0);
+            if (typeArgument == null || typeArgument.Expression is not TypeOfExpressionSyntax typeOfExpression) {
+                var desc = new DiagnosticDescriptor(
+                    id: "RCG001",
+                    title: "Malformed RequireComponentGetter type argument",
+                    messageFormat: "Type argument must be a typeof() expression: {0}",
+                    category: "ComponentUtils",
+                    defaultSeverity: DiagnosticSeverity.Error,
+                    isEnabledByDefault: true);
+                info.Diagnostics.Add(Diagnostic.Create(desc, attribute.GetLocation(), attribute.ToString()));
+                return;
+            }
+
+            //2nd argument "name" (required)
+            var nameArgument = GetAttributeArgumentByNameOrIndex(attribute, "name", 1);
+            if (nameArgument == null || nameArgument.Expression is not LiteralExpressionSyntax nameLiteralExpression) {
+                var desc = new DiagnosticDescriptor(
+                    id: "RCG002",
+                    title: "Malformed RequireComponentGetter type argument",
+                    messageFormat: "Name argument must be a literal string: {0}",
+                    category: "ComponentUtils",
+                    defaultSeverity: DiagnosticSeverity.Error,
+                    isEnabledByDefault: true);
+                info.Diagnostics.Add(Diagnostic.Create(desc, attribute.GetLocation(), attribute.ToString()));
+                return;
+            }
+
+            //3rd argument "visibility" (optional)
+            var visibilityArgument = GetAttributeArgumentByNameOrIndex(attribute, "visibility", 2);
+
+            //required argument values
+            var type = typeOfExpression.Type.ToString();
+            var name = nameLiteralExpression.Token.ValueText;
+
+            //optional argument values
+            //NOTE - default value must exactly match RequireComponentGetterAttribute argument default
+            var visibility = visibilityArgument?.Expression is LiteralExpressionSyntax literalExpression ? literalExpression.Token.ValueText : "public";
+
+            //add info
+            info.ComponentTypeArguments[type] = new RequireComponentGetterArguments {
+                Name = name,
+                Visibility = visibility,
+            };
         }
 
         private static string GetFullNamespace(SyntaxNode node) {
@@ -139,6 +272,19 @@ public partial class {info.ClassName} {{
             parts.Reverse();
 
             return string.Join(".", parts);
+        }
+
+        private static AttributeArgumentSyntax? GetAttributeArgumentByNameOrIndex(AttributeSyntax attribute, string name, int index) {
+            //find the argument by name
+            var arg = attribute.ArgumentList?.Arguments.FirstOrDefault(a => a.NameColon?.Name.ToString() == name);
+
+            //couldn't find the argument by name, try by index
+            //NOTE - named arguments cannot come before indexed arguments, so searching by name first is always correct
+            if (arg == null && attribute.ArgumentList?.Arguments.Count > index) {
+                arg = attribute.ArgumentList.Arguments[index];
+            }
+
+            return arg;
         }
     }
 }
