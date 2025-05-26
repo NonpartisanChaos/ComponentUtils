@@ -3,7 +3,10 @@
 ## Installation
 1. Open the Unity package manage from `Window -> Package Manager`
 2. Click `+` and select `Install package from git URL...`
-3. Enter `https://github.com/NonpartisanChaos/ComponentUtils.git` and click `Install`
+3. Enter the following URL and click `Install`:
+   ```
+   https://github.com/NonpartisanChaos/ComponentUtils.git
+   ```
 
 ## Overview
 
